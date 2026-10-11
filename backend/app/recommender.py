@@ -5,6 +5,10 @@ from collections import defaultdict
 from typing import Any
 
 IPC_METHODS = ["pipe", "shared_memory", "message_queue", "unix_socket"]
+IPC_LABELS = {"pipe": "Pipe", "shared_memory": "Shared Memory", "message_queue": "Message Queue", "unix_socket": "Unix Socket"}
+METRIC_LABELS = {"throughput_mbps": "throughput", "avg_latency_us": "average latency", "p95_latency_us": "P95 latency", "cpu_percent": "CPU usage", "peak_rss_mb": "memory footprint"}
+NOISE_FLOOR = 0.05  # relative spread below which a metric cannot separate mechanisms
+METRIC_UNITS = {"throughput_mbps": " MiB/s", "avg_latency_us": " µs", "p95_latency_us": " µs", "cpu_percent": "%", "peak_rss_mb": " MB"}
 
 # Weights for max-rate mode (rate=0)
 THROUGHPUT_WEIGHTS = {
@@ -39,6 +43,10 @@ def _feature_vector(row: dict[str, Any]) -> tuple[float, float, float, float]:
 def _distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
     scales = (1.0, 1.0, 2.0, 1.5)
     return math.sqrt(sum(((x - y) / s) ** 2 for x, y, s in zip(a, b, scales)))
+
+
+def _workload_key(row: dict[str, Any]) -> tuple[int, float, int]:
+    return (int(row["bytes"]), float(row["requested_rate"]), int(row.get("processes", 2)))
 
 
 def _fallback(bytes_: int, rate: float) -> tuple[str, str]:
@@ -80,24 +88,49 @@ def recommend(rows: list[dict[str, Any]], *, bytes_: int, rate: float, processes
         method, explanation = _fallback(bytes_, rate)
         return {"recommended_ipc": method, "confidence": 0.35, "mode": "fallback", "dominant_metric": None, "explanation": explanation, "evidence": [], "weights": active_weights}
 
-    profile_rows = _aggregate_replicates([r for r in rows if r.get("ipc") in IPC_METHODS], active_weights)
-    nearest_by_ipc: dict[str, list[tuple[float, dict[str, Any]]]] = defaultdict(list)
+    # Paced and max-rate runs measure different things (paced throughput is
+    # capped by the requested rate), so only match within the same regime.
+    paced = rate > 0
+    regime_rows = [
+        r for r in rows
+        if r.get("ipc") in IPC_METHODS and (float(r.get("requested_rate", 0.0)) > 0) == paced
+    ]
+    profile_rows = _aggregate_replicates(regime_rows, active_weights)
+    profiles_by_ipc: dict[str, dict[tuple[int, float, int], dict[str, Any]]] = defaultdict(dict)
     for row in profile_rows:
-        nearest_by_ipc[row["ipc"]].append((_distance(target, _feature_vector(row)), row))
+        profiles_by_ipc[row["ipc"]][_workload_key(row)] = row
+
+    # Workloads measured for every profiled mechanism. Interpolating over these
+    # compares like with like; otherwise a mechanism with an extra far-away
+    # profile (e.g. a 64 KB run) gets an estimate the others cannot match.
+    shared_keys = set.intersection(*(set(p) for p in profiles_by_ipc.values())) if profiles_by_ipc else set()
+    exact_key = (int(bytes_), float(rate), int(processes))
 
     estimated: dict[str, dict[str, float]] = {}
     evidence: dict[str, list[dict[str, Any]]] = {}
+    match_basis: dict[str, str] = {}
     all_metrics = set(THROUGHPUT_WEIGHTS) | set(RATE_LIMITED_WEIGHTS)
 
     for ipc in IPC_METHODS:
-        samples = sorted(nearest_by_ipc.get(ipc, []), key=lambda x: x[0])[:5]
-        if not samples:
+        profiles = profiles_by_ipc.get(ipc)
+        if not profiles:
             continue
+        if exact_key in profiles:
+            samples = [(0.0, profiles[exact_key])]
+            match_basis[ipc] = "exact"
+        else:
+            keys = shared_keys or set(profiles)
+            match_basis[ipc] = "shared" if shared_keys else "own"
+            samples = sorted(
+                ((_distance(target, _feature_vector(profiles[k])), profiles[k]) for k in keys),
+                key=lambda x: x[0],
+            )[:5]
         totals: dict[str, float] = {k: 0.0 for k in all_metrics}
         denom = 0.0
         evidence[ipc] = []
         for dist, row in samples:
-            w = 1.0 / (1.0 + dist)
+            # Shepard inverse-distance weighting: nearer profiles dominate.
+            w = 1.0 / max(dist, 1e-6) ** 2
             denom += w
             for key in all_metrics:
                 if key in row: totals[key] += w * float(row[key])
@@ -121,7 +154,9 @@ def recommend(rows: list[dict[str, Any]], *, bytes_: int, rate: float, processes
         mean_val = sum(vals) / len(vals) if vals else 1.0
         relative_span = span / (abs(mean_val) + 1e-9)
         for ipc, metrics in estimated.items():
-            if span <= 1e-12 or relative_span < 0.01:
+            # Spreads under NOISE_FLOOR are within run-to-run noise; treating
+            # them as real would let e.g. a 16 KB RSS gap decide the winner.
+            if span <= 1e-12 or relative_span < NOISE_FLOOR:
                 score = 0.5
             elif metric == "throughput_mbps":
                 score = (metrics[metric] - lo) / span
@@ -129,64 +164,62 @@ def recommend(rows: list[dict[str, Any]], *, bytes_: int, rate: float, processes
                 score = (hi - metrics[metric]) / span
             metric_scores[ipc][metric] = score
 
+    # The winner is decided purely by the measured, weighted scores. No
+    # hand-tuned per-mechanism bonuses: if the data says otherwise, the data wins.
     final_scores: dict[str, float] = {
         ipc: sum(active_weights[m] * scores[m] for m in active_weights)
         for ipc, scores in metric_scores.items()
     }
 
-    # ── OS THEORETICAL HEURISTIC PENALTIES ─────────────────────────────────────
-    # WSL2 microbenchmarks don't fully capture TLB/page-table setup costs for SHM
-    # on tiny payloads, or the kernel flow-control advantages of Unix sockets in 
-    # paced workloads. We blend empirical scores with theoretical OS constraints
-    # so recommendations match textbook OS design principles.
-    if bytes_ < 512:
-        final_scores["shared_memory"] -= 0.30 # TLB/setup overhead penalty
-        final_scores["pipe"] += 0.30          # Lightweight syscall bonus
-    
-    if rate > 0:
-        final_scores["unix_socket"] += 0.80   # Kernel buffer flow-control bonus (huge bump)
-        final_scores["shared_memory"] -= 0.60 # Polling inefficiency penalty (huge drop)
-    
-    if bytes_ >= 4096:
-        final_scores["shared_memory"] += 0.40 # Zero-copy dominance
-
-    # Ensure scores stay in bounds 0-1 for UI tracking
-    for ipc in final_scores:
-        final_scores[ipc] = max(0.01, min(0.99, final_scores[ipc]))
-
-    winner = max(final_scores, key=lambda k: final_scores[k])
-    ordered = sorted(final_scores.values(), reverse=True)
-    margin = ordered[0] - ordered[1] if len(ordered) > 1 else 1.0
+    ranked = sorted(final_scores, key=lambda k: final_scores[k], reverse=True)
+    winner = ranked[0]
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    margin = final_scores[winner] - final_scores[runner_up] if runner_up else 1.0
     evidence_count = sum(len(v) for v in evidence.values())
-    
+    missing = [ipc for ipc in IPC_METHODS if ipc not in estimated]
+
     exact_profile = any(any(item.get("distance", 1.0) == 0.0 for item in entries) for entries in evidence.values())
     base_confidence = 0.80 if exact_profile else 0.65
     confidence = min(0.95, base_confidence + min(0.20, max(0.0, margin)) + min(0.15, 0.03 * min(evidence_count, 5)))
+    # A winner picked without profiles for every mechanism is a weaker claim.
+    confidence *= len(estimated) / len(IPC_METHODS)
 
     winner_scores = metric_scores[winner]
-    dominant_metric = max(active_weights, key=lambda m: active_weights[m] * winner_scores.get(m, 0.0))
-    dominant_label = {"throughput_mbps": "throughput", "avg_latency_us": "average latency", "p95_latency_us": "P95 latency", "cpu_percent": "CPU efficiency", "peak_rss_mb": "memory footprint"}.get(dominant_metric, dominant_metric)
-
-    if bytes_ >= 4096:
-        workload_hint = f"At {bytes_} B payload, zero-copy Shared Memory has a structural advantage in both empirical and theoretical models."
-    elif bytes_ < 512 and rate == 0:
-        workload_hint = f"At {bytes_} B payload, Pipe wins due to minimal per-message syscall overhead, penalising Shared Memory for TLB costs."
-    elif rate > 0:
-        workload_hint = f"Rate-limited pacing ({rate:.0f} msg/s) strongly favours Unix Sockets due to efficient kernel-level flow control."
+    if runner_up:
+        # The metric that contributed most to beating the runner-up.
+        runner_scores = metric_scores[runner_up]
+        dominant_metric = max(active_weights, key=lambda m: active_weights[m] * (winner_scores[m] - runner_scores[m]))
     else:
-        workload_hint = "Decision blends empirical profile matching with theoretical OS constraints."
-
+        dominant_metric = max(active_weights, key=lambda m: active_weights[m] * winner_scores.get(m, 0.0))
+    dominant_label = METRIC_LABELS.get(dominant_metric, dominant_metric)
     score_desc = "45/30/15/10 (paced mode)" if rate > 0 else "40/30/20/10 (max-rate mode)"
+
+    if runner_up:
+        unit = METRIC_UNITS.get(dominant_metric, "")
+        comparison = (
+            f"It beat runner-up {IPC_LABELS[runner_up]} mainly on {dominant_label}: "
+            f"{estimated[winner][dominant_metric]:.2f}{unit} vs {estimated[runner_up][dominant_metric]:.2f}{unit}."
+        )
+    else:
+        comparison = f"{IPC_LABELS[winner]} is the only mechanism with profiles."
+    if all(basis == "exact" for basis in match_basis.values()):
+        comparison += " All values measured at exactly this workload."
+    else:
+        comparison += " Some values are interpolated from the nearest workloads measured for every mechanism." if shared_keys \
+            else " Mechanisms share no common workload, so values are interpolated from each one's own profiles."
+    if missing:
+        comparison += f" Not yet profiled{' in paced mode' if paced else ''}: {', '.join(IPC_LABELS[m] for m in missing)}."
 
     return {
         "recommended_ipc": winner,
         "confidence": round(confidence, 4),
         "mode": "profile_based",
         "dominant_metric": dominant_metric,
-        "explanation": f"Decision driven by {dominant_label}. Scored using {score_desc}. {workload_hint}",
+        "explanation": f"Decision driven by {dominant_label}. Scored using {score_desc}. {comparison}",
         "estimated_metrics": estimated,
         "final_scores": {k: round(v, 4) for k, v in final_scores.items()},
         "metric_scores": metric_scores,
         "evidence": evidence,
+        "match_basis": match_basis,
         "weights": active_weights,
     }
