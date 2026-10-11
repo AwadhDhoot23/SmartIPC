@@ -8,7 +8,7 @@ SmartIPC benchmarks four Linux IPC mechanisms — Pipe, Shared Memory, Message Q
 > Contributors: Awadh Dhoot · AV (Aryavardhan Sharma)
 
 > 💡 **Faculty Presentation Guide:**  
-> For faculty review and project viva/demo, see [PRESENTATION.md](./PRESENTATION.md) — a dedicated, conceptual explanation covering the core problem, the 4 IPC mechanisms, WAISA algorithm logic, and live demo test cases.
+> For faculty review and project viva/demo, see [PRESENTATION.md](./docs/PRESENTATION.md) — a dedicated, conceptual explanation covering the core problem, the 4 IPC mechanisms, WAISA algorithm logic, and live demo test cases.
 
 ---
 
@@ -67,7 +67,6 @@ SmartIPC then:
 ```
 SmartIPC_final/
 +-- README.md                   # System documentation & setup guide
-+-- PRESENTATION.md             # Faculty project presentation & core concepts walkthrough
 +-- cpp/                        # C++ benchmark binary
 |   +-- src/
 |   |   +-- main.cpp            # CLI entry point
@@ -119,6 +118,7 @@ SmartIPC_final/
 |   +-- check_environment.sh   # Environment verifier
 |
 +-- docs/                       # Project documentation
+|   +-- PRESENTATION.md         # Faculty project walkthrough & viva defense guide
 |   +-- DETAILED_DESIGN.md
 |   +-- PROJECT_REPORT.md
 |   +-- EXPERIMENT_PLAN.md

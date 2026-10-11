@@ -25,7 +25,7 @@ export const metricLabels = {
 }
 
 export const PRESETS = [
-  { name: 'Tiny messages', hint: 'Pipe tends to win', form: { bytes: 64, messages: 1000, warmup: 100, rate: 0 } },
-  { name: 'Bulk transfer', hint: 'Shared memory tends to win', form: { bytes: 65536, messages: 1000, warmup: 100, rate: 0 } },
-  { name: 'Paced stream', hint: 'Unix socket tends to win', form: { bytes: 1024, messages: 1000, warmup: 100, rate: 500 } },
+  { name: 'Tiny messages', hint: '64 B · High-frequency ping-pong', form: { bytes: 64, messages: 1000, warmup: 100, rate: 0 } },
+  { name: 'Bulk transfer', hint: '64 KiB · Large data payload', form: { bytes: 65536, messages: 1000, warmup: 100, rate: 0 } },
+  { name: 'Paced stream', hint: '1 KiB · 500 msg/s rate-controlled', form: { bytes: 1024, messages: 1000, warmup: 100, rate: 500 } },
 ]
