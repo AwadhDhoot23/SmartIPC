@@ -46,7 +46,11 @@ UsageSnapshot get_usage(int who) {
     UsageSnapshot s;
     s.user_sec = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6;
     s.sys_sec = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+#ifdef __APPLE__
+    s.max_rss_kb = ru.ru_maxrss / 1024;  // macOS reports bytes, Linux reports KiB
+#else
     s.max_rss_kb = ru.ru_maxrss;
+#endif
     return s;
 }
 

@@ -1,6 +1,10 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic -pthread
-LDFLAGS ?= -pthread -lrt
+LDFLAGS ?= -pthread
+# librt only exists on Linux; macOS provides shm_open/sem_open in libc.
+ifeq ($(shell uname -s),Linux)
+LDFLAGS += -lrt
+endif
 
 BUILD := build
 TARGET := $(BUILD)/smartipc_bench
